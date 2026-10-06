@@ -16,7 +16,7 @@ homogeneous intervals improve accuracy, cross-well generalization and interpreta
 - full feature set (incl. HP, OB, DT_NCT, TVD) vs raw logs only
 - Output: `results/lowo_results.csv`, `results/lowo_summary.csv`
 
-Preliminary, single seed, 4 folds: results are noisy; treat as a sanity check, not a conclusion.
+Preliminary: 4 folds x 3 XGBoost seeds. Short windows (10 m) look better than pointwise on the full feature set (mean R² +0.10 vs -0.30), but 25-100 m do not improve consistently and gains vary by well. See `results/lowo_summary_3seeds.csv`.
 
 ## Layout
 - `src/` code, `results/` metrics (small CSVs only), `data/` local data (git-ignored)
