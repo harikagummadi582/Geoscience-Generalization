@@ -1,0 +1,17 @@
+# Raw / licensed well data - never commit
+data/*
+!data/README.md
+*.csv
+!results/*.csv
+*.CSV
+*.las
+*.xlsx
+# Models and caches
+*.pkl
+*.h5
+*.joblib
+__pycache__/
+.ipynb_checkpoints/
+*.ipynb
+.venv/
+.DS_Store
