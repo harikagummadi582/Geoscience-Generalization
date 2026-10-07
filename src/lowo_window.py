@@ -1,60 +1,103 @@
-"""LOWO baseline + fixed-window prototype for pore pressure (4 Murree wells).
+"""Pointwise vs fixed-window pore-pressure models on the 21 Potwar wells.
 
-Usage: python lowo_window.py <data_dir> <out_dir>
+Usage:
+  python lowo_window.py <data_dir> <out_dir> --mode profile
+  python lowo_window.py <data_dir> <out_dir> --mode fixed [--seed 0]
+  python lowo_window.py <data_dir> <out_dir> --mode lowo  [--features full] [--seed 0]
+
+Notes (from data/README.md):
+- PPP is a predicted pore-pressure curve, so results are agreement with PPP, not error vs measured pressure.
+- PINDORI-1/2 are sampled ~4x finer than most wells; every well is decimated to ~0.15 m so wells
+  contribute in proportion to their depth interval, not their sample count.
+- Always split by well, never by row.
 """
-import sys, glob, os, json
+import argparse, glob, os, time
 import numpy as np
 import pandas as pd
 import xgboost as xgb
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
-DATA, OUT = sys.argv[1], sys.argv[2]
-os.makedirs(OUT, exist_ok=True)
+ap = argparse.ArgumentParser()
+ap.add_argument('data'); ap.add_argument('out')
+ap.add_argument('--mode', choices=['profile', 'fixed', 'lowo', 'smooth'], default='fixed')
+ap.add_argument('--features', default='full,raw')
+ap.add_argument('--windows', default='10,25,50,100')
+ap.add_argument('--seed', type=int, default=0)
+ap.add_argument('--trees', type=int, default=200)
+args = ap.parse_args()
+os.makedirs(args.out, exist_ok=True)
 
+TEST = ['RAJIAN-03A', 'PINDORI-2', 'TURKWAL DEEP X 2', 'Balkassar POL 01']
+VAL = ['MINWAL-X-1', 'MINWAL-2', 'MISSA KESWAL-02', 'Balkassar OXY 01']
 ESSENTIAL = ['tvd', 'dt', 'dt_nct', 'gr', 'sphi', 'hp', 'ob']
 OPTIONAL = ['rhob_combined', 'res_deep']
-RANGES = {'MISSA KESWAL-01': (1136.8, 1802.3), 'MISSA KESWAL-02': (1115, 1792.9),
+MURREE = {'MISSA KESWAL-01': (1136.8, 1802.3), 'MISSA KESWAL-02': (1115, 1792.9),
           'MISSA KESWAL-03': (1124.8, 1870.9), 'QAZIAN -1X': (1198.8, 2062.9)}
+TARGET_STEP = 0.1524
+FULL = ['tvd', 'dt', 'dt_nct', 'gr', 'sphi', 'hp', 'ob', 'rhob_combined', 'res_deep',
+        'eaton_ratio', 'hp_gradient', 'ob_gradient', 'tvd_normalized']
+RAW = ['gr', 'dt', 'sphi', 'rhob_combined', 'res_deep']
+FEATSETS = {'full': FULL, 'raw': RAW}
+CTX = ['gr', 'dt', 'sphi', 'rhob_combined', 'res_deep']
+ANOM = [CTX.index('gr'), CTX.index('dt')]
 
 
 def load(path):
     name = os.path.basename(path).rsplit('.', 1)[0]
     df = pd.read_csv(path)
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '')
+    n_raw = len(df)
     df = df.replace([-999.25, -999, -999.0], np.nan)
-    lo, hi = RANGES[name]
-    df = df[(df['depth'] >= lo) & (df['depth'] <= hi)]
+    info = dict(well=name, raw_rows=n_raw)
+    missing = [c for c in ESSENTIAL + OPTIONAL + ['ppp', 'depth'] if c not in df.columns]
+    if missing:
+        info.update(status=f'skipped: missing {missing}')
+        return None, info
+    if name in MURREE:
+        lo, hi = MURREE[name]
+        df = df[(df.depth >= lo) & (df.depth <= hi)]
     df = df.dropna(subset=['ppp'] + ESSENTIAL + OPTIONAL)
     df = df[(df.ppp > 100) & (df.ppp < 30000) & (df.hp > 100) & (df.hp < 20000)
-            & (df.ob > 100) & (df.ob < 30000) & (df.tvd > 0) & (df.tvd < 6000)]
-    df = df.sort_values('depth').reset_index(drop=True)
+            & (df.ob > 100) & (df.ob < 30000) & (df.tvd > 0) & (df.tvd < 6000)
+            & (df.dt > 0) & (df.dt_nct > 0)]
+    df = df.sort_values('depth').drop_duplicates('depth').reset_index(drop=True)
+    if len(df) < 600:
+        info.update(status=f'skipped: only {len(df)} clean rows', clean_rows=len(df))
+        return None, info
+    raw_step = float(df.depth.diff().median())
+    k = max(1, int(round(TARGET_STEP / raw_step)))
+    df = df.iloc[::k].reset_index(drop=True)
+    step = raw_step * k
     df['well'] = name
     df['eaton_ratio'] = (df.dt / df.dt_nct) ** 3
     tvd_ft = df.tvd * 3.28084
     df['hp_gradient'] = df.hp / tvd_ft
     df['ob_gradient'] = df.ob / tvd_ft
     df['tvd_normalized'] = df.tvd / df.tvd.max()
-    # continuous run id: new run when depth jumps > 1.5x median step
-    step = df.depth.diff().median()
     df['run'] = (df.depth.diff() > 1.5 * step).cumsum()
     df.attrs['step'] = step
-    return df
+    info.update(status='ok', clean_rows=len(df) * k, used_rows=len(df), decimate_k=k,
+                step_m=round(step, 4), runs=int(df.run.nunique()),
+                depth_min=round(df.depth.min(), 1), depth_max=round(df.depth.max(), 1),
+                ppp_min=round(df.ppp.min()), ppp_max=round(df.ppp.max()))
+    return df, info
 
 
-wells = {}
-for p in sorted(glob.glob(os.path.join(DATA, '*.CSV')) + glob.glob(os.path.join(DATA, '*.csv'))):
-    d = load(p)
-    wells[d['well'].iloc[0]] = d
-    print(d['well'].iloc[0], len(d), 'step', round(d.attrs['step'], 4), 'runs', d.run.nunique())
-
-FULL = ['tvd', 'dt', 'dt_nct', 'gr', 'sphi', 'hp', 'ob', 'rhob_combined', 'res_deep',
-        'eaton_ratio', 'hp_gradient', 'ob_gradient', 'tvd_normalized']
-RAW = ['gr', 'dt', 'sphi', 'rhob_combined', 'res_deep']
-CTX = ['gr', 'dt', 'sphi', 'rhob_combined', 'res_deep']
+wells, infos = {}, []
+for p in sorted(glob.glob(os.path.join(args.data, '*.CSV')) + glob.glob(os.path.join(args.data, '*.csv'))):
+    d, info = load(p)
+    infos.append(info)
+    if d is not None:
+        wells[info['well']] = d
+prof = pd.DataFrame(infos)
+prof.to_csv(os.path.join(args.out, 'well_profile.csv'), index=False)
+print(prof.to_string(), flush=True)
+print('wells used:', len(wells), 'rows:', sum(len(d) for d in wells.values()), flush=True)
+if args.mode == 'profile':
+    raise SystemExit
 
 
 def make_windows(df, win_m):
-    """Return list of index arrays; 50% overlap; never spans a gap."""
     step = df.attrs['step']
     W = max(8, int(round(win_m / step)))
     S = max(1, W // 2)
@@ -68,79 +111,121 @@ def make_windows(df, win_m):
         starts = list(range(0, n - W + 1, S))
         if starts[-1] != n - W:
             starts.append(n - W)
-        for s in starts:
-            wins.append(idx[s:s + W])
+        wins.extend(idx[s:s + W] for s in starts)
     return wins
 
 
-def window_rows(df, win_m, base_feats):
-    """One row per (window, sample) with sample features + window-context features."""
-    wins = make_windows(df, win_m)
-    parts = []
-    for wid, idx in enumerate(wins):
-        w = df.loc[idx]
-        row = w[base_feats].copy()
-        z = (w.depth.values - w.depth.values.mean())
-        for c in CTX:
-            v = w[c].values
-            row[f'{c}_wmean'] = v.mean()
-            row[f'{c}_wstd'] = v.std()
-            row[f'{c}_wslope'] = (np.polyfit(z, v, 1)[0] if len(v) > 2 and z.std() > 0 else 0.0)
-            if c in ('gr', 'dt'):
-                row[f'{c}_anom'] = v - v.mean()
-        row['src_index'] = idx
-        row['wid'] = wid
-        parts.append(row)
-    return pd.concat(parts, ignore_index=True)
+_cache = {}
 
 
-def fit_predict(Xtr, ytr, Xte, seed=int(os.environ.get("SEED", 0))):
-    m = xgb.XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=5, subsample=0.8,
-                         colsample_bytree=0.8, random_state=seed, n_jobs=4, verbosity=0)
-    m.fit(Xtr, ytr)
-    return m.predict(Xte)
+def window_block(well, win_m):
+    """src row positions + window-context features (independent of the feature set)."""
+    key = (well, win_m)
+    if key in _cache:
+        return _cache[key]
+    df = wells[well]
+    ctx = df[CTX].to_numpy(float)
+    depth = df.depth.to_numpy(float)
+    src, blocks = [], []
+    for idx in make_windows(df, win_m):
+        c = ctx[idx]
+        mean, std = c.mean(0), c.std(0)
+        z = depth[idx] - depth[idx].mean()
+        zz = (z ** 2).sum()
+        slope = (z[:, None] * (c - mean)).sum(0) / zz if zz > 0 else np.zeros(c.shape[1])
+        stats = np.concatenate([mean, std, slope])
+        anom = c[:, ANOM] - mean[ANOM]
+        blocks.append(np.hstack([np.tile(stats, (len(idx), 1)), anom]))
+        src.append(idx)
+    out = (np.concatenate(src), np.vstack(blocks))
+    _cache[key] = out
+    return out
 
 
-def metrics(y, p):
-    return dict(r2=r2_score(y, p), rmse=float(np.sqrt(mean_squared_error(y, p))),
-                mae=mean_absolute_error(y, p))
+def window_xy(well, win_m, fs):
+    src, blk = window_block(well, win_m)
+    df = wells[well]
+    X = np.hstack([df[FEATSETS[fs]].to_numpy(float)[src], blk])
+    return X, df.ppp.to_numpy(float)[src], src
+
+
+def point_xy(well, fs):
+    df = wells[well]
+    return df[FEATSETS[fs]].to_numpy(float), df.ppp.to_numpy(float)
+
+
+def fit(X, y):
+    m = xgb.XGBRegressor(n_estimators=args.trees, learning_rate=0.06, max_depth=5, subsample=0.8,
+                         colsample_bytree=0.8, tree_method='hist', random_state=args.seed,
+                         n_jobs=2, verbosity=0)
+    m.fit(X, y)
+    return m
+
+
+def run_split(train_wells, eval_wells, fs, win, tag, writer):
+    t0 = time.time()
+    if win is None:
+        Xs, ys = zip(*[point_xy(w, fs) for w in train_wells])
+        model = fit(np.vstack(Xs), np.concatenate(ys))
+        for w in eval_wells:
+            X, y = point_xy(w, fs)
+            writer(tag, fs, 'point', 0, w, y, model.predict(X))
+    else:
+        parts = [window_xy(w, win, fs) for w in train_wells]
+        model = fit(np.vstack([p[0] for p in parts]), np.concatenate([p[1] for p in parts]))
+        for w in eval_wells:
+            X, y, src = window_xy(w, win, fs)
+            p = model.predict(X)
+            n = len(wells[w])
+            merged = np.bincount(src, weights=p, minlength=n) / np.maximum(np.bincount(src, minlength=n), 1)
+            writer(tag, fs, 'window', win, w, wells[w].ppp.to_numpy(float), merged)
+    print(f'  [{tag} {fs} win={win}] {time.time() - t0:.0f}s', flush=True)
 
 
 rows = []
-names = list(wells)
-configs = [('point', None)] + [('window', w) for w in (10, 25, 50, 100)]
-for fs_name, fs in (('full', FULL), ('raw', RAW)):
-    for kind, win in configs:
-        for test in names:
-            train = [n for n in names if n != test]
-            te = wells[test]
-            if kind == 'point':
-                Xtr = pd.concat([wells[n][fs] for n in train])
-                ytr = pd.concat([wells[n].ppp for n in train])
-                pred = fit_predict(Xtr, ytr, te[fs])
-                y = te.ppp.values
-            else:
-                tr_parts = []
-                for n in train:
-                    r = window_rows(wells[n], win, fs)
-                    r['y'] = wells[n].loc[r.src_index, 'ppp'].values
-                    tr_parts.append(r)
-                tr = pd.concat(tr_parts, ignore_index=True)
-                tew = window_rows(te, win, fs)
-                featcols = [c for c in tr.columns if c not in ('src_index', 'wid', 'y')]
-                p = fit_predict(tr[featcols], tr.y, tew[featcols])
-                # merge overlapping window predictions by averaging per source sample
-                merged = pd.Series(p).groupby(tew.src_index.values).mean()
-                pred = merged.reindex(te.index).values
-                y = te.ppp.values
-            m = metrics(y, pred)
-            m.update(dict(features=fs_name, model=kind, window_m=win, test_well=test, n=len(y)))
-            rows.append(m)
-            print(f"{fs_name:4s} {kind:6s} {str(win):>4s} {test:16s} R2={m['r2']:.3f} RMSE={m['rmse']:.0f}", flush=True)
+fn = os.path.join(args.out, f'{args.mode}_results_{args.features.replace(",", "-")}_seed{args.seed}.csv')
 
-res = pd.DataFrame(rows)
-res.to_csv(os.path.join(OUT, 'lowo_results.csv'), index=False)
-summ = res.groupby(['features', 'model', 'window_m'], dropna=False).agg(
-    mean_r2=('r2', 'mean'), mean_rmse=('rmse', 'mean'), mean_mae=('mae', 'mean')).reset_index()
-print(summ.to_string())
-summ.to_csv(os.path.join(OUT, 'lowo_summary.csv'), index=False)
+
+def writer(tag, fs, kind, win, well, y, p):
+    if tag == 'fixed':
+        tag = 'val' if well in VAL else 'test'
+    r = dict(split=tag, features=fs, model=kind, window_m=win, well=well, n=len(y),
+             r2=r2_score(y, p), rmse=float(np.sqrt(mean_squared_error(y, p))),
+             mae=mean_absolute_error(y, p), seed=args.seed)
+    rows.append(r)
+    pd.DataFrame(rows).to_csv(fn, index=False)
+    print(f"{tag:5s} {fs:4s} {kind:6s} {win:>4} {well:18s} R2={r['r2']:.3f} RMSE={r['rmse']:.0f}", flush=True)
+
+
+def smooth_control(fs):
+    """Control: pointwise model + centred moving average of the same length (no window context)."""
+    names_ = list(wells)
+    for te in names_:
+        tr = [w for w in names_ if w != te]
+        Xs, ys = zip(*[point_xy(w, fs) for w in tr])
+        model = fit(np.vstack(Xs), np.concatenate(ys))
+        X, y = point_xy(te, fs)
+        p = pd.Series(model.predict(X))
+        df = wells[te]
+        for win in [int(w) for w in args.windows.split(',')]:
+            Wn = max(8, int(round(win / df.attrs['step'])))
+            ps = p.groupby(df.run.values).transform(lambda v: v.rolling(Wn, center=True, min_periods=1).mean())
+            writer('lowo', fs, 'point_smooth', win, te, y, ps.to_numpy())
+
+
+names = list(wells)
+if args.mode == 'smooth':
+    for fs in args.features.split(','):
+        smooth_control(fs)
+    print('done', flush=True)
+    raise SystemExit
+configs = [None] + [int(w) for w in args.windows.split(',')]
+for fs in args.features.split(','):
+    for win in configs:
+        if args.mode == 'fixed':
+            tr = [w for w in names if w not in TEST + VAL]
+            run_split(tr, [w for w in VAL + TEST if w in wells], fs, win, 'fixed', writer)
+        else:
+            for te in names:
+                run_split([w for w in names if w != te], [te], fs, win, 'lowo', writer)
+print('done', flush=True)

@@ -11,7 +11,7 @@ data-driven geological segmentation (e.g. change-point detection) and test wheth
 homogeneous intervals improve accuracy, cross-well generalization and interpretability.
 
 ## Current status (prototype)
-`src/lowo_window.py` runs leave-one-well-out (LOWO) XGBoost on the four Murree-formation wells:
+`src/lowo_window.py` runs XGBoost on all 21 Potwar wells (fixed split by well, and leave-one-well-out). An earlier 4-well run is in `results/`; the 21-well results are in `results/21wells/`. Wells are resampled to ~0.15 m and PPP is treated as a predicted curve, not measured pressure:
 - pointwise baseline vs fixed windows (10/25/50/100 m, 50% overlap, predictions averaged where windows overlap)
 - full feature set (incl. HP, OB, DT_NCT, TVD) vs raw logs only
 - Output: `results/lowo_results.csv`, `results/lowo_summary.csv`
