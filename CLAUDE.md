@@ -45,9 +45,10 @@ Fixed split, test wells (full): pointwise R2 0.455 / RMSE 627; 10 m 0.461 / 528;
 50 m 0.503 / 590; 100 m 0.351 / 653. Raw-logs-only is negative R2 everywhere (inputs HP/OB/DT_NCT/TVD matter).
 
 ## Open issues / next tasks
-1. **Smoothing control (not yet run):** averaging overlapping window predictions smooths output.
-   Compare against pointwise predictions smoothed with a centred moving average of the same length,
-   to show the gain is not just smoothing.
+1. **Smoothing control (done, `--mode smooth`):** pointwise predictions smoothed with a centred moving average
+   of the same length: RMSE 558 / 584 / 619 / 638 psi at 10 / 25 / 50 / 100 m (R2 0.474 / 0.441 / 0.387 / 0.356).
+   The window model (452 / 462 / 495 / 534 psi) beats it on 18 / 19 / 19 / 17 of 21 wells, so the gain is mostly
+   not just smoothing. Table: `results/21wells/summary_lowo_with_smooth.csv`.
 2. Add tests (`tests/`): windows never span a depth gap; no well in both train and test; merged
    predictions cover every sample once.
 3. Data-driven segmentation (change-point detection) vs fixed windows.
