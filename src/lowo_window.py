@@ -19,7 +19,9 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
 ap = argparse.ArgumentParser()
 ap.add_argument('data'); ap.add_argument('out')
-ap.add_argument('--mode', choices=['profile', 'fixed', 'lowo', 'smooth'], default='fixed')
+ap.add_argument('--mode', choices=['profile', 'fixed', 'lowo', 'smooth', 'overlap'], default='fixed')
+ap.add_argument('--overlaps', default='50', help='window overlap in %% (mode overlap loops over these)')
+ap.add_argument('--split', choices=['fixed', 'lowo'], default='fixed', help='split used by --mode overlap')
 ap.add_argument('--features', default='full,raw')
 ap.add_argument('--windows', default='10,25,50,100')
 ap.add_argument('--seed', type=int, default=0)
@@ -97,10 +99,13 @@ if args.mode == 'profile':
     raise SystemExit
 
 
+OV = 50  # current window overlap in percent (50 = previous behaviour: stride W//2)
+
+
 def make_windows(df, win_m):
     step = df.attrs['step']
     W = max(8, int(round(win_m / step)))
-    S = max(1, W // 2)
+    S = max(1, W * (100 - OV) // 100)
     wins = []
     for _, g in df.groupby('run'):
         idx = g.index.values
@@ -120,7 +125,7 @@ _cache = {}
 
 def window_block(well, win_m):
     """src row positions + window-context features (independent of the feature set)."""
-    key = (well, win_m)
+    key = (well, win_m, OV)
     if key in _cache:
         return _cache[key]
     df = wells[well]
@@ -183,7 +188,8 @@ def run_split(train_wells, eval_wells, fs, win, tag, writer):
 
 
 rows = []
-fn = os.path.join(args.out, f'{args.mode}_results_{args.features.replace(",", "-")}_seed{args.seed}.csv')
+_tag = f'overlap-{args.split}' if args.mode == 'overlap' else args.mode
+fn = os.path.join(args.out, f'{_tag}_results_{args.features.replace(",", "-")}_seed{args.seed}.csv')
 
 
 def writer(tag, fs, kind, win, well, y, p):
@@ -191,7 +197,8 @@ def writer(tag, fs, kind, win, well, y, p):
         tag = 'val' if well in VAL else 'test'
     r = dict(split=tag, features=fs, model=kind, window_m=win, well=well, n=len(y),
              r2=r2_score(y, p), rmse=float(np.sqrt(mean_squared_error(y, p))),
-             mae=mean_absolute_error(y, p), seed=args.seed)
+             mae=mean_absolute_error(y, p), seed=args.seed,
+             overlap_pct=(OV if kind == 'window' else None))
     rows.append(r)
     pd.DataFrame(rows).to_csv(fn, index=False)
     print(f"{tag:5s} {fs:4s} {kind:6s} {win:>4} {well:18s} R2={r['r2']:.3f} RMSE={r['rmse']:.0f}", flush=True)
@@ -217,6 +224,24 @@ names = list(wells)
 if args.mode == 'smooth':
     for fs in args.features.split(','):
         smooth_control(fs)
+    print('done', flush=True)
+    raise SystemExit
+if args.mode == 'overlap':
+    tr_fixed = [w for w in names if w not in TEST + VAL]
+
+    def do(fs, win):
+        if args.split == 'fixed':
+            run_split(tr_fixed, [w for w in VAL + TEST if w in wells], fs, win, 'fixed', writer)
+        else:
+            for te in names:
+                run_split([w for w in names if w != te], [te], fs, win, 'lowo', writer)
+
+    for fs in args.features.split(','):
+        do(fs, None)  # pointwise reference, overlap does not apply
+        for ov in [int(o) for o in args.overlaps.split(',')]:
+            OV = ov
+            for win in [int(w) for w in args.windows.split(',')]:
+                do(fs, win)
     print('done', flush=True)
     raise SystemExit
 configs = [None] + [int(w) for w in args.windows.split(',')]
