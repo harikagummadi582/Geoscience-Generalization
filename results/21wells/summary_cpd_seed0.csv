@@ -1,0 +1,8 @@
+model,window_m,seg,r2,rmse,mae,wells_beating_pointwise
+point,0,,0.398,592.718,469.539,
+window,10,cpd,0.546,529.147,413.735,20.0
+window,10,equal,0.631,470.739,366.753,19.0
+window,25,cpd,0.568,515.692,404.164,19.0
+window,25,equal,0.613,481.328,378.018,20.0
+window,50,cpd,0.555,525.507,414.673,16.0
+window,50,equal,0.575,512.134,405.711,19.0

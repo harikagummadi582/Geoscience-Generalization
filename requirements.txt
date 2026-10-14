@@ -2,3 +2,5 @@ numpy
 pandas
 scikit-learn
 xgboost
+ruptures  # tests only (checks binseg_l2)
+pytest

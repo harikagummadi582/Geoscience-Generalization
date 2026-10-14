@@ -19,7 +19,7 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
 ap = argparse.ArgumentParser()
 ap.add_argument('data'); ap.add_argument('out')
-ap.add_argument('--mode', choices=['profile', 'fixed', 'lowo', 'smooth', 'overlap'], default='fixed')
+ap.add_argument('--mode', choices=['profile', 'fixed', 'lowo', 'smooth', 'overlap', 'cpd', 'shap'], default='fixed')
 ap.add_argument('--overlaps', default='50', help='window overlap in %% (mode overlap loops over these)')
 ap.add_argument('--split', choices=['fixed', 'lowo'], default='fixed', help='split used by --mode overlap')
 ap.add_argument('--features', default='full,raw')
@@ -39,7 +39,12 @@ TARGET_STEP = 0.1524
 FULL = ['tvd', 'dt', 'dt_nct', 'gr', 'sphi', 'hp', 'ob', 'rhob_combined', 'res_deep',
         'eaton_ratio', 'hp_gradient', 'ob_gradient', 'tvd_normalized']
 RAW = ['gr', 'dt', 'sphi', 'rhob_combined', 'res_deep']
-FEATSETS = {'full': FULL, 'raw': RAW}
+FEATSETS = {'full': FULL, 'raw': RAW,
+            # ablations: drop one pressure/depth input (and the features derived from it)
+            'no_hp': [c for c in FULL if c not in ('hp', 'hp_gradient')],
+            'no_ob': [c for c in FULL if c not in ('ob', 'ob_gradient')],
+            'no_dtnct': [c for c in FULL if c not in ('dt_nct', 'eaton_ratio')],
+            'no_tvd': [c for c in FULL if c not in ('tvd', 'tvd_normalized', 'hp_gradient', 'ob_gradient')]}
 CTX = ['gr', 'dt', 'sphi', 'rhob_combined', 'res_deep']
 ANOM = [CTX.index('gr'), CTX.index('dt')]
 
@@ -100,11 +105,63 @@ if args.mode == 'profile':
 
 
 OV = 50  # current window overlap in percent (50 = previous behaviour: stride W//2)
+SEG = 'fixed'  # 'fixed' sliding windows | 'equal' equal split | 'cpd' change-point segments (no overlap)
+
+
+def binseg_l2(sig, n_bkps, min_size=8, jump=2):
+    """Greedy binary segmentation with the L2 cost, using cumulative sums so it stays fast on long wells.
+    Same method as ruptures.Binseg(model='l2', min_size, jump); tests/test_binseg.py checks they agree."""
+    n = len(sig)
+    s1 = np.vstack([np.zeros((1, sig.shape[1])), np.cumsum(sig, 0)])
+    s2 = np.concatenate([[0.0], np.cumsum((sig ** 2).sum(1))])
+
+    def cost(a, b):
+        return (s2[b] - s2[a]) - ((s1[b] - s1[a]) ** 2).sum(-1) / (b - a)
+
+    def best(a, b):
+        t = np.arange(a + min_size, b - min_size + 1)
+        t = t[t % jump == 0]
+        if len(t) == 0:
+            return -np.inf, None
+        gain = cost(a, b) - cost(a, t) - cost(t, b)
+        i = int(gain.argmax())
+        return float(gain[i]), int(t[i])
+
+    segs = {(0, n): best(0, n)}
+    bkps = []
+    for _ in range(n_bkps):
+        (a, b), (gain, t) = max(segs.items(), key=lambda kv: kv[1][0])
+        if t is None:
+            break
+        del segs[(a, b)]
+        bkps.append(t)
+        segs[(a, t)], segs[(t, b)] = best(a, t), best(t, b)
+    return sorted(bkps) + [n]
 
 
 def make_windows(df, win_m):
     step = df.attrs['step']
     W = max(8, int(round(win_m / step)))
+    if SEG in ('equal', 'cpd'):
+        # K segments per continuous run, K = run length / target length. 'equal' cuts evenly,
+        # 'cpd' puts the K-1 breakpoints where GR, DT and RHOB change most (logs only, no target).
+        x = df[['gr', 'dt', 'rhob_combined']].to_numpy(float)
+        sig = (x - x.mean(0)) / (x.std(0) + 1e-9)
+        wins = []
+        for _, g in df.groupby('run'):
+            idx = g.index.values
+            K = max(1, int(round(len(idx) / W)))
+            if K == 1 or len(idx) < 16:
+                wins.append(idx)
+            elif SEG == 'equal':
+                wins.extend(np.array_split(idx, K))
+            else:
+                bk = binseg_l2(sig[idx], K - 1)
+                s = 0
+                for b in bk:
+                    wins.append(idx[s:b])
+                    s = b
+        return wins
     S = max(1, W * (100 - OV) // 100)
     wins = []
     for _, g in df.groupby('run'):
@@ -125,7 +182,7 @@ _cache = {}
 
 def window_block(well, win_m):
     """src row positions + window-context features (independent of the feature set)."""
-    key = (well, win_m, OV)
+    key = (well, win_m, OV, SEG)
     if key in _cache:
         return _cache[key]
     df = wells[well]
@@ -198,7 +255,7 @@ def writer(tag, fs, kind, win, well, y, p):
     r = dict(split=tag, features=fs, model=kind, window_m=win, well=well, n=len(y),
              r2=r2_score(y, p), rmse=float(np.sqrt(mean_squared_error(y, p))),
              mae=mean_absolute_error(y, p), seed=args.seed,
-             overlap_pct=(OV if kind == 'window' else None))
+             overlap_pct=(OV if kind == 'window' else None), seg=(SEG if kind == 'window' else None))
     rows.append(r)
     pd.DataFrame(rows).to_csv(fn, index=False)
     print(f"{tag:5s} {fs:4s} {kind:6s} {win:>4} {well:18s} R2={r['r2']:.3f} RMSE={r['rmse']:.0f}", flush=True)
@@ -242,6 +299,60 @@ if args.mode == 'overlap':
             OV = ov
             for win in [int(w) for w in args.windows.split(',')]:
                 do(fs, win)
+    print('done', flush=True)
+    raise SystemExit
+if args.mode == 'cpd':
+    # leave-one-well-out: pointwise vs equal-length segments vs change-point segments (same segment count)
+    for fs in args.features.split(','):
+        for te in names:
+            run_split([w for w in names if w != te], [te], fs, None, 'lowo', writer)
+        for win in [int(w) for w in args.windows.split(',')]:
+            for SEG in ('equal', 'cpd'):
+                for te in names:
+                    run_split([w for w in names if w != te], [te], fs, win, 'lowo', writer)
+    print('done', flush=True)
+    raise SystemExit
+if args.mode == 'shap':
+    # TreeSHAP (XGBoost pred_contribs) per change-point segment on the 4 test wells, trained leave-one-well-out
+    SEG = 'cpd'
+    win = int(args.windows.split(',')[0])
+    fs = args.features.split(',')[0]
+    cols = FEATSETS[fs] + [f'{c}_{s}' for s in ('mean', 'std', 'slope') for c in CTX] + ['gr_anom', 'dt_anom']
+    press = ('tvd', 'hp', 'ob', 'dt_nct', 'eaton_ratio', 'hp_gradient', 'ob_gradient', 'tvd_normalized')
+    grp = np.array(['pressure/depth' if c in press else 'point logs' if c in CTX else 'segment context' for c in cols])
+    seg_rows, feat_rows = [], []
+    for te in [w for w in names if w in TEST]:
+        parts = [window_xy(w, win, fs) for w in names if w != te]
+        model = fit(np.vstack([p[0] for p in parts]), np.concatenate([p[1] for p in parts]))
+        X, y, src = window_xy(te, win, fs)
+        pred = model.predict(X)
+        sv = np.abs(model.get_booster().predict(xgb.DMatrix(X), pred_contribs=True)[:, :-1])
+        wl = make_windows(wells[te], win)
+        sid = np.repeat(np.arange(len(wl)), [len(w) for w in wl])
+        df = wells[te]
+        feat_rows.append(pd.Series(sv.mean(0), index=cols, name=te))
+        for k in range(len(wl)):
+            m = sid == k
+            f = sv[m].mean(0)
+            r = dict(well=te, segment=k, top_m=df.depth.to_numpy()[src[m]].min(), bottom_m=df.depth.to_numpy()[src[m]].max(),
+                     n=int(m.sum()), mean_gr=float(df.gr.to_numpy()[src[m]].mean()),
+                     rmse=float(np.sqrt(np.mean((y[m] - pred[m]) ** 2))), top_feature=cols[int(f.argmax())])
+            for g in ('pressure/depth', 'point logs', 'segment context'):
+                r['share_' + g] = float(f[grp == g].sum() / f.sum())
+            seg_rows.append(r)
+    seg = pd.DataFrame(seg_rows)
+    seg.to_csv(os.path.join(args.out, f'shap_segments_{win}m_cpd.csv'), index=False)
+    imp = pd.DataFrame(feat_rows)
+    imp.to_csv(os.path.join(args.out, f'shap_feature_importance_{win}m_cpd.csv'))
+    print('mean |SHAP| (psi) over the test wells, top 10 features:')
+    print(imp.mean().sort_values(ascending=False).head(10).round(1).to_string())
+    print('share of |SHAP| by input type, mean over segments:')
+    print(seg[[c for c in seg if c.startswith('share_')]].mean().round(3).to_string())
+    seg['gr_level'] = seg.groupby('well').mean_gr.transform(lambda v: pd.qcut(v, 3, labels=['low GR', 'mid GR', 'high GR']))
+    print('share by segment GR level (within each well):')
+    print(seg.groupby('gr_level')[[c for c in seg if c.startswith('share_')]].mean().round(3).to_string())
+    print('most common top feature per segment:')
+    print(seg.top_feature.value_counts().head(6).to_string())
     print('done', flush=True)
     raise SystemExit
 configs = [None] + [int(w) for w in args.windows.split(',')]
