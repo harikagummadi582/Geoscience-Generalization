@@ -22,6 +22,7 @@ ap.add_argument('data'); ap.add_argument('out')
 ap.add_argument('--mode', choices=['profile', 'fixed', 'lowo', 'smooth', 'overlap', 'cpd', 'shap'], default='fixed')
 ap.add_argument('--overlaps', default='50', help='window overlap in %% (mode overlap loops over these)')
 ap.add_argument('--split', choices=['fixed', 'lowo'], default='fixed', help='split used by --mode overlap')
+ap.add_argument('--only', default='', help='mode overlap, split lowo: only hold out these wells (comma list)')
 ap.add_argument('--features', default='full,raw')
 ap.add_argument('--windows', default='10,25,50,100')
 ap.add_argument('--seed', type=int, default=0)
@@ -291,6 +292,8 @@ if args.mode == 'overlap':
             run_split(tr_fixed, [w for w in VAL + TEST if w in wells], fs, win, 'fixed', writer)
         else:
             for te in names:
+                if args.only and te not in args.only.split(','):
+                    continue
                 run_split([w for w in names if w != te], [te], fs, win, 'lowo', writer)
 
     for fs in args.features.split(','):
